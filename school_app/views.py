@@ -6,7 +6,7 @@ from .models import Student, Teacher, AcademicLevel, Subject, Group, Session, At
 from django.urls import reverse # For redirecting with arguments
 import datetime # For year validation
 import math # For floor function
-from django.db.models import Q # For complex queries
+from django.db.models import Q, Sum # For complex queries
 from django.db import IntegrityError # For catching unique constraint violations
 from django.contrib import messages # For success/error messages
 from django.utils import timezone # Moved to top
@@ -1781,16 +1781,13 @@ def payment_report(request):
             income_from_sessions += price_per_session
 
     # Calculate Total Expenses (Teacher Payments)
-    compensated_sessions = Session.objects.filter(teacher_compensated=True).select_related('group')
+    compensated_sessions = Session.objects.filter(teacher_compensated=True)
     if start_date and end_date:
         compensated_sessions = compensated_sessions.filter(date__gte=start_date, date__lte=end_date)
 
-    for session_obj in compensated_sessions:
-        if session_obj.group and session_obj.group.price_per_4_sessions > 0:
-            price_per_session = session_obj.group.price_per_4_sessions / Decimal('4.0')
-            # Ensure TEACHER_SESSION_PAY_RATE is defined and used correctly.
-            # This rate (0.7) seems to be the teacher's share of the session fee.
-            total_expenses += (price_per_session * TEACHER_SESSION_PAY_RATE)
+    # Sum the actual amounts paid to teachers from the new field
+    total_expenses_agg = compensated_sessions.aggregate(total=Sum('teacher_payment_amount'))
+    total_expenses = total_expenses_agg['total'] or Decimal('0.00')
 
     total_income = income_from_registration + income_from_sessions
     net_income = total_income - total_expenses
@@ -2870,10 +2867,27 @@ def teacher_monthly_payment_view(request, teacher_id):
                 return redirect(redirect_url)
 
             session_ids_to_mark = calculated_payment_details.get('selected_session_ids', [])
-            final_payment_amount = Decimal(calculated_payment_details.get('calculated_total_payment', '0'))
+            teacher_price_decimal = Decimal(calculated_payment_details.get('teacher_price_per_session', '0'))
+
+            final_payment_amount = Decimal('0.00')
+            compensated_count = 0
 
             with transaction.atomic():
-                compensated_count = Session.objects.filter(id__in=session_ids_to_mark, group=current_group_post).update(teacher_compensated=True)
+                sessions_to_process = Session.objects.filter(id__in=session_ids_to_mark, group=current_group_post)
+                for session in sessions_to_process:
+                    # Calculate payable instances for this specific session
+                    payable_instances_count = Attendance.objects.filter(
+                        session=session
+                    ).filter(Q(present=True) | Q(excused_absence=False)).count()
+
+                    session_payment_amount = payable_instances_count * teacher_price_decimal
+
+                    session.teacher_payment_amount = session_payment_amount
+                    session.teacher_compensated = True
+                    session.save()
+
+                    final_payment_amount += session_payment_amount
+                    compensated_count += 1
 
             if compensated_count > 0:
                 student_count = current_group_post.students.count()
