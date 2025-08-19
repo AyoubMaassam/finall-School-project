@@ -2242,6 +2242,21 @@ def api_record_attendance_by_student(request):
         attendance.present = True
         attendance.save()
 
+        auto_excused_message = ""
+        # Rule 2: If this is the student's first-ever 'present' record in this group, excuse previous absences.
+        if Attendance.objects.filter(student=student, session__group=target_session.group, present=True).count() == 1:
+            previous_absences_to_excuse = Attendance.objects.filter(
+                student=student,
+                session__group=target_session.group,
+                session__date__lt=target_session.date,
+                present=False,
+                excused_absence=False
+            )
+            updated_count = previous_absences_to_excuse.update(excused_absence=True)
+            if updated_count > 0:
+                auto_excused_message = f"تم تحويل {updated_count} غياب سابق إلى غياب معذور تلقائياً."
+
+
         # Calculate unpaid sessions for the student in this group
         try:
             student_group = StudentGroup.objects.get(student=student, group=target_session.group)
@@ -2269,7 +2284,8 @@ def api_record_attendance_by_student(request):
             'session_info': f'{target_session.group.name} - {target_session.date}',
             'payment_status_message': payment_status_message,
             'session_id': target_session.id,
-            'unpaid_sessions_count': unpaid_sessions_count
+            'unpaid_sessions_count': unpaid_sessions_count,
+            'auto_excused_message': auto_excused_message
         }, status=201)
 
     except Exception as e:
