@@ -2059,12 +2059,36 @@ import qrcode
 @require_POST
 def mark_absence_excused(request, student_id, attendance_id):
     student = get_object_or_404(Student, id=student_id)
-    attendance = get_object_or_404(Attendance, id=attendance_id, student=student)
+    # Eagerly load related objects to prevent extra DB queries
+    attendance = get_object_or_404(
+        Attendance.objects.select_related('session__group'),
+        id=attendance_id,
+        student=student
+    )
 
     if not attendance.present:
-        attendance.excused_absence = True
-        attendance.save()
-        messages.success(request, f"تم تسجيل غياب حصة {attendance.session.date} كغياب معذور.")
+        with transaction.atomic():
+            was_paid = attendance.student_paid_for_session
+
+            # Always mark as excused
+            attendance.excused_absence = True
+
+            # If it was paid, refund the student and mark as unpaid
+            if was_paid:
+                group = attendance.session.group
+                if group.price_per_4_sessions and group.price_per_4_sessions > Decimal('0'):
+                    price_per_session = group.price_per_4_sessions / Decimal('4')
+                    student.prepaid_balance += price_per_session
+                    student.save()
+
+                    attendance.student_paid_for_session = False
+                    messages.success(request, f"تم تسجيل غياب حصة {attendance.session.date.strftime('%Y-%m-%d')} كغياب معذور، وتمت إعادة مبلغ الحصة إلى رصيد الطالب.")
+                else:
+                    messages.info(request, f"تم تسجيل غياب حصة {attendance.session.date.strftime('%Y-%m-%d')} كغياب معذور (لم يتم استرداد أي مبلغ لأن سعر الحصة هو صفر).")
+            else:
+                messages.success(request, f"تم تسجيل غياب حصة {attendance.session.date.strftime('%Y-%m-%d')} كغياب معذور.")
+
+            attendance.save()
     else:
         messages.warning(request, "لا يمكن تسجيل غياب معذور لحصة كان الطالب فيها حاضراً.")
 
