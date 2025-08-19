@@ -2446,15 +2446,39 @@ def student_monthly_payment_view(request, student_id):
             session_id_to_excuse = request.POST.get('session_id')
             if session_id_to_excuse:
                 try:
-                    attendance_to_excuse = Attendance.objects.get(session_id=session_id_to_excuse, student=student)
+                    attendance_to_excuse = Attendance.objects.select_related('session__group').get(session_id=session_id_to_excuse, student=student)
+
+                    # Ensure the session belongs to the group being viewed to calculate price correctly
+                    if attendance_to_excuse.session.group.id != current_group_details_post.id:
+                        messages.error(request, "خطأ: الحصة لا تنتمي إلى الفوج المحدد.")
+                        return redirect(reverse('student_monthly_payment', args=[student_id]) + f'?group_id={group_id_post}')
+
                     if not attendance_to_excuse.present:
-                        attendance_to_excuse.excused_absence = True
-                        # If an absence is excused, it should not be marked as needing payment for that session.
-                        # However, if it was already paid, the payment is usually not refunded automatically.
-                        # For this logic, we assume excusing makes it not count towards future dues.
-                        # If it was 'student_absent_and_forced_paid', that might need review.
-                        attendance_to_excuse.save()
-                        messages.success(request, f"تم تسجيل غياب حصة {attendance_to_excuse.session.date} كغياب معذور.")
+                        # Start a database transaction to ensure all or nothing is saved.
+                        with transaction.atomic():
+                            was_paid = attendance_to_excuse.student_paid_for_session
+
+                            # Always mark as excused
+                            attendance_to_excuse.excused_absence = True
+
+                            # If it was paid, refund the student and mark as unpaid
+                            if was_paid:
+                                if current_price_per_session_post > Decimal('0'):
+                                    student.prepaid_balance += current_price_per_session_post
+                                    student.save()
+
+                                    attendance_to_excuse.student_paid_for_session = False
+
+                                    messages.success(request, f"تم تسجيل غياب حصة {attendance_to_excuse.session.date.strftime('%Y-%m-%d')} كغياب معذور، وتمت إعادة مبلغ الحصة إلى رصيد الطالب.")
+                                else:
+                                    # This case handles if the session price is zero, still mark as excused
+                                    messages.info(request, f"تم تسجيل غياب حصة {attendance_to_excuse.session.date.strftime('%Y-%m-%d')} كغياب معذور (لم يتم استرداد أي مبلغ لأن سعر الحصة هو صفر).")
+                            else:
+                                # If it wasn't paid, just mark it as excused
+                                messages.success(request, f"تم تسجيل غياب حصة {attendance_to_excuse.session.date.strftime('%Y-%m-%d')} كغياب معذور.")
+
+                            attendance_to_excuse.save()
+
                     else:
                         messages.warning(request, "لا يمكن تسجيل غياب معذور لحصة كان الطالب فيها حاضراً.")
                 except Attendance.DoesNotExist:
