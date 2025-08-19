@@ -2879,18 +2879,43 @@ def teacher_monthly_payment_view(request, teacher_id):
                 return redirect(redirect_url)
 
             try:
-                attendance = get_object_or_404(Attendance, id=attendance_id_to_excuse, session__group=current_group_post)
+                # Use select_related to pre-fetch related objects in one go
+                attendance = get_object_or_404(
+                    Attendance.objects.select_related('student', 'session__group'),
+                    id=attendance_id_to_excuse,
+                    session__group=current_group_post
+                )
+
                 if attendance.present:
                     messages.warning(request, "لا يمكن عذر طالب حاضر.")
                 else:
-                    attendance.excused_absence = True
-                    attendance.save()
-                    messages.success(request, f"تم عذر غياب الطالب {attendance.student.full_name} بنجاح.")
+                    with transaction.atomic():
+                        was_paid = attendance.student_paid_for_session
+                        student_to_refund = attendance.student
 
-                    # Invalidate any previous calculation
-                    if 'calculated_teacher_payment_details' in request.session:
-                        del request.session['calculated_teacher_payment_details']
-                        messages.info(request, "تم إلغاء الحساب السابق، يرجى إعادة حساب المبلغ.")
+                        # Always mark as excused
+                        attendance.excused_absence = True
+
+                        if was_paid:
+                            group_price = attendance.session.group.price_per_4_sessions
+                            if group_price and group_price > Decimal('0'):
+                                price_per_session = group_price / Decimal('4')
+                                student_to_refund.prepaid_balance += price_per_session
+                                student_to_refund.save()
+
+                                attendance.student_paid_for_session = False
+                                messages.success(request, f"تم عذر غياب الطالب {attendance.student.full_name} وإعادة مبلغ {price_per_session} دج إلى رصيده.")
+                            else:
+                                messages.success(request, f"تم عذر غياب الطالب {attendance.student.full_name} بنجاح (لم يتم استرداد أي مبلغ لأن سعر الحصة هو صفر).")
+                        else:
+                            messages.success(request, f"تم عذر غياب الطالب {attendance.student.full_name} بنجاح.")
+
+                        attendance.save()
+
+                        # Invalidate any previous calculation since the number of payable instances might change
+                        if 'calculated_teacher_payment_details' in request.session:
+                            del request.session['calculated_teacher_payment_details']
+                            messages.info(request, "تم إلغاء الحساب السابق، يرجى إعادة حساب المبلغ.")
 
             except Http404:
                 messages.error(request, "لم يتم العثور على سجل الحضور المحدد.")
