@@ -16,6 +16,7 @@ from .forms import GroupForm, SessionForm # Import GroupForm and SessionForm
 from django.core.paginator import Paginator, EmptyPage, PageNotAnInteger
 from django.views.decorators.csrf import csrf_exempt
 import logging
+from urllib.parse import quote
 
 # Helper function for logging
 logger = logging.getLogger(__name__)
@@ -2524,6 +2525,7 @@ def student_monthly_payment_view(request, student_id):
 
         elif action == 'process_payment':
             amount_paid_str = request.POST.get('amount_paid')
+            notes_from_form = request.POST.get('notes', '') # Get notes from the form
             try:
                 amount_paid_from_form = Decimal(amount_paid_str) # Renamed to avoid conflict
                 amount_paid = amount_paid_from_form # Effective amount to be used for payment processing
@@ -2637,7 +2639,9 @@ def student_monthly_payment_view(request, student_id):
                     # Always try to generate a receipt URL if a payment was attempted
                     if amount_paid_from_form > Decimal('0.00') or prepaid_used_this_transaction > Decimal('0.00'):
                         paid_session_ids_str = ",".join(list_of_session_ids_just_paid)
-                        receipt_url = reverse('print_student_payment_receipt', args=[student_id, current_group_details_post.id]) + f"?amount_paid={amount_paid_from_form}&session_ids={paid_session_ids_str}&prepaid_used={prepaid_used_this_transaction}"
+                        # URL-encode the notes to handle special characters
+                        encoded_notes = quote(notes_from_form)
+                        receipt_url = reverse('print_student_payment_receipt', args=[student_id, current_group_details_post.id]) + f"?amount_paid={amount_paid_from_form}&prepaid_used={prepaid_used_this_transaction}&notes={encoded_notes}"
                         request.session['last_payment_receipt_url'] = receipt_url
                     # The condition for amount_paid <= 0 (effective) is handled by the error message earlier.
 
@@ -2715,40 +2719,43 @@ def student_monthly_payment_view(request, student_id):
 def print_student_payment_receipt(request, student_id, group_id):
     student = get_object_or_404(Student, id=student_id)
     group = get_object_or_404(Group, id=group_id)
-    amount_paid_str = request.GET.get('amount_paid', '0') # This is cash/card payment
-    session_ids_str = request.GET.get('session_ids', '')
+    amount_paid_str = request.GET.get('amount_paid', '0')
     prepaid_used_str = request.GET.get('prepaid_used', '0')
-
+    notes = request.GET.get('notes', '') # Optional notes
 
     try:
         amount_paid_cash_card = Decimal(amount_paid_str)
         prepaid_used = Decimal(prepaid_used_str)
-    except ValueError:
-        amount_paid_cash_card = Decimal('0.00')
-        prepaid_used = Decimal('0.00')
-        # messages.error(request, "بيانات الإيصال غير صالحة.") # Cannot send messages from here easily
-        # return redirect(...) # Or handle error appropriately
+    except (ValueError, TypeError):
+        return HttpResponseRedirect(reverse('student_monthly_payment', args=[student_id]))
 
     total_credited_for_sessions = amount_paid_cash_card + prepaid_used
 
-    paid_sessions = []
-    if session_ids_str:
-        try:
-            session_ids = [int(sid) for sid in session_ids_str.split(',') if sid.isdigit()]
-            # Ensure sessions belong to the specified group for this student's receipt context
-            paid_sessions = Session.objects.filter(id__in=session_ids, group=group).order_by('date', 'start_time')
-        except ValueError:
-            pass # Keep paid_sessions empty
+    # Generate a unique receipt ID
+    now = timezone.now()
+    receipt_id = f"student_receipt_{student.id}_{group.id}_{now.strftime('%Y%m%d%H%M%S')}"
+
+    # Generate barcode
+    barcode_image_base64 = None
+    try:
+        Code128 = barcode.get_barcode_class('code128')
+        # The writer needs bytes, so we encode the string
+        code = Code128(receipt_id, writer=ImageWriter())
+        buffer = BytesIO()
+        code.write(buffer)
+        barcode_image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+    except Exception as e:
+        logger.error(f"Error generating barcode for receipt {receipt_id}: {e}")
+        # Continue without a barcode if generation fails
 
     context = {
         'student': student,
         'group': group,
-        'amount_paid_cash_card': amount_paid_cash_card, # Actual amount handed over
-        'prepaid_used': prepaid_used, # Amount taken from prepaid balance
-        'total_credited_for_sessions': total_credited_for_sessions, # Total value applied to sessions
-        'paid_sessions': paid_sessions,
-        'price_per_session': group.price_per_4_sessions / Decimal('4') if group.price_per_4_sessions and group.price_per_4_sessions > 0 else Decimal('0.00'),
-        'print_date': timezone.now(),
+        'total_credited_for_sessions': total_credited_for_sessions,
+        'notes': notes,
+        'print_date': now,
+        'receipt_id': receipt_id,
+        'barcode_image_base64': barcode_image_base64,
     }
     return render(request, 'school_app/print_student_payment_receipt.html', context)
 
@@ -2778,6 +2785,19 @@ def print_teacher_payment_receipt(request, teacher_id, group_id):
         messages.error(request, "بيانات الإيصال غير صالحة.")
         return redirect(reverse('teacher_monthly_payment', args=[teacher_id]) + f"?group_id={group_id}")
 
+    now = timezone.now()
+    receipt_id = f"teacher_receipt_{teacher.id}_{group.id}_{now.strftime('%Y%m%d%H%M%S')}"
+
+    barcode_image_base64 = None
+    try:
+        Code128 = barcode.get_barcode_class('code128')
+        code = Code128(receipt_id, writer=ImageWriter())
+        buffer = BytesIO()
+        code.write(buffer)
+        barcode_image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+    except Exception as e:
+        logger.error(f"Error generating barcode for receipt {receipt_id}: {e}")
+
     context = {
         'teacher': teacher,
         'group': group,
@@ -2788,7 +2808,9 @@ def print_teacher_payment_receipt(request, teacher_id, group_id):
         'student_count': student_count,
         'total_sessions': total_sessions,
         'excused_absences_count': excused_absences_count,
-        'print_date': timezone.now(),
+        'print_date': now,
+        'receipt_id': receipt_id,
+        'barcode_image_base64': barcode_image_base64,
     }
     return render(request, 'school_app/print_teacher_payment_receipt.html', context)
 
